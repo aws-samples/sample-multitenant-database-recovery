@@ -1,0 +1,21 @@
+{
+  "name": "simulate-activity",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "mysql2": "^3.14.1",
+    "pg": "^8.15.5"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.787.0",
+    "@types/aws-lambda": "^8.10.149",
+    "@types/pg": "^8.11.14",
+    "aws-lambda": "^1.0.7"
+  },
+  "description": ""
+}

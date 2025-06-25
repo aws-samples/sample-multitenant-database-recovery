@@ -1,0 +1,44 @@
+{
+  "name": "multienant-postgres-restore",
+  "version": "0.1.0",
+  "bin": {
+    "multienant-postgres-restore": "dist/bin/multienant-postgres-restore.js"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "copy-assets": "npm run copy-state-machines && npm run copy-certs",
+    "copy-state-machines": "mkdir -p dist/lib/state-machines && cp lib/state-machines/*.json dist/lib/state-machines/",
+    "copy-certs": "cp lib/assets/global-bundle.pem lib/containers/ddl-extraction/ && cp lib/assets/global-bundle.pem lib/containers/ddl-apply/",
+    "build": "npx eslint . && npm run clean && npm run compile && npm run copy-assets && npm run build-lambdas",
+    "build-lambdas": "npm run build-lambda-create-secret && npm run build-lambda-init-database && npm run build-lambda-simulate-activity && npm run build-lambda-extract-ddl && npm run build-lambda-pre-dms-ddl && npm run build-lambda-post-dms-ddl",
+    "build-lambda-create-secret": "cd lib/lambda/create-secret && npm install",
+    "build-lambda-init-database": "cd lib/lambda/init-database && npm install",
+    "build-lambda-simulate-activity": "cd lib/lambda/simulate-activity && npm install",
+    "build-lambda-extract-ddl": "cd lib/lambda/extract-ddl && npm install",
+    "build-lambda-pre-dms-ddl": "cd lib/lambda/pre-dms-ddl-apply && npm install",
+    "build-lambda-post-dms-ddl": "cd lib/lambda/post-dms-ddl-apply && npm install",
+    "build-containers": "cd lib/containers/ddl-apply && npm install",
+    "compile": "tsc",
+    "watch": "tsc -w",
+    "cdk": "cdk",
+    "format": "npx prettier . --write"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.29.0",
+    "@types/jest": "^29.5.14",
+    "@types/node": "22.7.9",
+    "aws-cdk": "2.1005.0",
+    "eslint": "^9.29.0",
+    "jest": "^29.7.0",
+    "prettier": "3.5.3",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.6.3",
+    "typescript-eslint": "^8.34.1"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.181.1",
+    "cdk-nag": "^2.36.21",
+    "constructs": "^10.0.0"
+  }
+}

@@ -1,0 +1,1322 @@
+{
+  "Comment": "State machine that performs a targeted schema database or table restoration",
+  "StartAt": "Set up global variables",
+  "States": {
+    "Set up global variables": {
+      "Type": "Pass",
+      "Next": "Record restoration process",
+      "Output": {},
+      "Assign": {
+        "DynamoDBTableName": "${DynamoDBTableName}",
+        "DbSecurityGroupId": "${DbSecurityGroupId}",
+        "DmsSecurityGroupId": "${DmsSecurityGroupId}",
+        "DMSInstanceClass": "${DMSInstanceClass}",
+        "DMSEngineVersion": "${DMSEngineVersion}",
+        "DbEngine": "postgres",
+        "OriginDBIdentifier": "${OriginDBIdentifier}",
+        "RDSSecretARN": "${RDSSecretARN}",
+        "DbSubnetGroupName": "${DbSubnetGroupName}",
+        "DmsSubnetGroupName": "${DmsSubnetGroupName}",
+        "LambdaCreateSecretArn": "${LambdaCreateSecretArn}",
+        "ECSClusterArn": "${ECSClusterArn}",
+        "DDLExtractTaskDefinitionArn": "${DDLExtractTaskDefinitionArn}",
+        "DDLExtractTaskSecurityGroupId": "${DDLExtractTaskSecurityGroupId}",
+        "DDLApplyTaskDefinitionArn": "${DDLApplyTaskDefinitionArn}",
+        "DDLApplyTaskSecurityGroupId": "${DDLApplyTaskSecurityGroupId}",
+        "ECSTaskSubnet": "${ECSTaskSubnet}",
+        "DDLExtractTaskContainerName": "${DDLExtractTaskContainerName}",
+        "DDLApplyTaskContainerName": "${DDLApplyTaskContainerName}",
+        "PreDMSDDLLambdaArn": "${PreDMSDDLLambdaArn}",
+        "PostDMSDDLLambdaArn": "${PostDMSDDLLambdaArn}",
+        "DDLStorageBucket": "${DDLStorageBucket}",
+        "DMSRoleArn": "${DMSRoleArn}",
+        "RecoveredSchemasSuffix": "{% '_' & $toMillis($now()) %}",
+        "ResourceIdentifier": "{% '${ResourcesPrefix}' & $uuid() %}",
+        "RestoreTime": "{% $exists($states.input.restoreTime) ? $states.input.restoreTime : '' %}",
+        "SchemasNames": "{% $states.input.schemas %}",
+        "DatabaseToRestore": "{% $states.input.database %}",
+        "SnapshotId": "{% $exists($states.input.snapshotId)? $states.input.snapshotId : '' %}",
+        "DMSAllocatedStorage": 20,
+        "Tags": ${Tags}
+      }
+    },
+    "Record restoration process": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Arguments": {
+        "TableName": "{% $DynamoDBTableName %}",
+        "Item": {
+          "restoreId": {
+            "S": "{% $states.context.Execution.Name %}"
+          },
+          "timestamp": {
+            "S": "{% $states.context.Execution.StartTime %}"
+          },
+          "status": "started"
+        }
+      },
+      "Next": "Create Replication Instance"
+    },
+    "Create Replication Instance": {
+      "Type": "Task",
+      "Arguments": {
+        "ReplicationInstanceIdentifier": "{% $ResourceIdentifier %}",
+        "AllocatedStorage": "{% $DMSAllocatedStorage %}",
+        "ReplicationInstanceClass": "{% $DMSInstanceClass %}",
+        "VpcSecurityGroupIds": [
+          "{% $DmsSecurityGroupId %}"
+        ],
+        "ReplicationSubnetGroupIdentifier": "{% $DmsSubnetGroupName %}",
+        "MultiAZ": false,
+        "EngineVersion": "{% $DMSEngineVersion %}",
+        "AutoMinorVersionUpgrade": true,
+        "PubliclyAccessible": false,
+        "Tags": "{% $Tags %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:createReplicationInstance",
+      "Next": "Check if the Instance is an RDS instance or an Aurora cluster",
+      "Assign": {
+        "ReplicationInstanceArn": "{% $states.result.ReplicationInstance.ReplicationInstanceArn %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          },
+          "Comment": "Create replication instance failed"
+        }
+      ]
+    },
+    "Check if the Instance is an RDS instance or an Aurora cluster": {
+      "Type": "Task",
+      "Arguments": {
+        "DbClusterIdentifier": "{% $OriginDBIdentifier %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:rds:describeDBClusters",
+      "Next": "Is it a cluster ?",
+      "Assign": {
+        "IsCluster": "{% $boolean($count($states.result.DbClusters) > 0) %}",
+        "EngineMode": "{% $states.result.DbClusters[0].EngineMode %}",
+        "DbEngine": "{% $states.result.DbClusters[0].Engine %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "Rds.RdsException",
+            "Rds.DbClusterNotFoundException"
+          ],
+          "Comment": "Database is not a cluser",
+          "Next": "Is it a cluster ?",
+          "Assign": {
+            "IsCluster": false
+          }
+        }
+      ]
+    },
+    "Is it a cluster ?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "is it cluster PITR ?",
+          "Condition": "{% $IsCluster = true %}"
+        }
+      ],
+      "Default": "is it instance PITR"
+    },
+    "is it instance PITR": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "RestoreDBInstanceToPointInTime",
+          "Condition": "{% $RestoreTime != '' %}",
+          "Comment": "RestoreTime is provided"
+        },
+        {
+          "Next": "RestoreDBInstanceFromDBSnapshot",
+          "Condition": "{% $SnapshotId != '' %}",
+          "Comment": "SnapshotId is provided"
+        }
+      ],
+      "Default": "missing snapshot ID or Restore time"
+    },
+    "RestoreDBInstanceFromDBSnapshot": {
+      "Type": "Task",
+      "Arguments": {
+        "DbInstanceIdentifier": "{% $ResourceIdentifier %}",
+        "DbSnapshotIdentifier": "{% $SnapshotId %}",
+        "DbSubnetGroupName": "{% $DbSubnetGroupName %}",
+        "VpcSecurityGroupIds": [
+          "{% $DbSecurityGroupId  %}"
+        ],
+        "DeletionProtection": false,
+        "Tags": "{% $Tags %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:rds:restoreDBInstanceFromDBSnapshot",
+      "Next": "Check status of Instance",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          }
+        }
+      ]
+    },
+    "RestoreDBInstanceToPointInTime": {
+      "Type": "Task",
+      "Arguments": {
+        "TargetDBInstanceIdentifier": "{% $ResourceIdentifier %}",
+        "SourceDBInstanceIdentifier": "{% $OriginDBIdentifier %}",
+        "RestoreTime": "{% $RestoreTime %}",
+        "DbSubnetGroupName": "{% $DbSubnetGroupName %}",
+        "VpcSecurityGroupIds": [
+          "{% $DbSecurityGroupId  %}"
+        ],
+        "DeletionProtection": false,
+        "Tags": "{% $Tags %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:rds:restoreDBInstanceToPointInTime",
+      "Next": "Check status of Instance",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          }
+        }
+      ]
+    },
+    "Check status of Instance": {
+      "Type": "Task",
+      "Arguments": {
+        "DbInstanceIdentifier": "{% $ResourceIdentifier %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:rds:describeDBInstances",
+      "Next": "Is the instance ready ?",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process"
+        }
+      ]
+    },
+    "Is the instance ready ?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "Wait for instance to be available",
+          "Condition": "{% $states.input.DbInstances[0].DbInstanceStatus != 'available' %}"
+        }
+      ],
+      "Default": "Create New Secret for The restored database",
+      "Assign": {
+        "RestoredDbEndpoint": "{% $states.input.DbInstances[0].Endpoint.Address %}",
+        "RestoredDbPort": "{% $states.input.DbInstances[0].Endpoint.Port %}"
+      }
+    },
+    "Create New Secret for The restored database": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Output": "{% $states.result.Payload %}",
+      "Arguments": {
+        "FunctionName": "{% $LambdaCreateSecretArn %}",
+        "Payload": {
+          "dbInstanceIdentifier": "{% $ResourceIdentifier %}",
+          "host": "{% $RestoredDbEndpoint %}",
+          "port": "{% $RestoredDbPort %}",
+          "secretName": "{% $ResourceIdentifier %}",
+          "restoreTime": "{% $exists($RestoreTime)? $RestoreTime: null %}",
+          "snapshotId": "{% $exists($SnapshotId)? $SnapshotId: null %}",
+          "Tags": "{% $Tags %}"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Assign": {
+        "RestoredDbSecretArn": "{% $states.result.Payload.secretArn %}"
+      },
+      "Next": "Extract Database DDL",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          },
+          "Comment": "Create new secret failed"
+        }
+      ]
+    },
+    "Extract Database DDL": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Arguments": {
+        "LaunchType": "FARGATE",
+        "Tags": "{% $Tags %}",
+        "Cluster": "{% $ECSClusterArn %}",
+        "TaskDefinition": "{% $DDLExtractTaskDefinitionArn %}",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "SecurityGroups": [
+              "{% $DDLExtractTaskSecurityGroupId %}"
+            ],
+            "Subnets": [
+              "{% $ECSTaskSubnet %}"
+            ],
+            "AssignPublicIp": "DISABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "{% $DDLExtractTaskContainerName %}",
+              "Environment": [
+                {
+                  "Name": "DB_SECRET_ARN",
+                  "Value": "{% $RestoredDbSecretArn %}"
+                },
+                {
+                  "Name": "DB_NAME",
+                  "Value": "{% $DatabaseToRestore %}"
+                },
+                {
+                  "Name": "TARGET_SCHEMAS",
+                  "Value": "{% $join($SchemasNames, ',') %}"
+                },
+                {
+                  "Name": "RECOVERY_SUFFIX",
+                  "Value": "{% $RecoveredSchemasSuffix %}"
+                },
+                {
+                  "Name": "S3_BUCKET",
+                  "Value": "{% $DDLStorageBucket %}"
+                },
+                {
+                  "Name": "S3_PREFIX",
+                  "Value": "{% $ResourceIdentifier %}"
+                },
+                {
+                  "Name": "TASK_TOKEN",
+                  "Value": "{% $states.context.Task.Token %}"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Next": "Apply pre DMS migration DDL",
+      "Assign": {
+        "PreDMSObjectUrl": "{% $states.result.preDMSObjectUrl %}",
+        "PreDMSObjectKey": "{% $states.result.preDMSObjectKey %}",
+        "PostDMSObjectUrl": "{% $states.result.postDMSObjectUrl %}",
+        "PostDMSObjectKey": "{% $states.result.postDMSObjectKey %}",
+        "CompleteSchemaKey": "{% $states.result.completeSchemaKey %}",
+        "CompleteSchemaUrl": "{% $states.result.completeSchemaUrl %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "In case of error",
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          }
+        }
+      ]
+    },
+    "Apply pre DMS migration DDL": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Arguments": {
+        "LaunchType": "FARGATE",
+        "Cluster": "{% $ECSClusterArn %}",
+        "TaskDefinition": "{% $DDLApplyTaskDefinitionArn %}",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "SecurityGroups": [
+              "{% $DDLApplyTaskSecurityGroupId %}"
+            ],
+            "Subnets": [
+              "{% $ECSTaskSubnet %}"
+            ],
+            "AssignPublicIp": "DISABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "{% $DDLApplyTaskContainerName %}",
+              "Environment": [
+                {
+                  "Name": "DB_SECRET_ARN",
+                  "Value": "{% $RDSSecretARN %}"
+                },
+                {
+                  "Name": "DB_NAME",
+                  "Value": "{% $DatabaseToRestore %}"
+                },
+                {
+                  "Name": "S3_BUCKET",
+                  "Value": "{% $DDLStorageBucket %}"
+                },
+                {
+                  "Name": "S3_OBJECT_KEY",
+                  "Value": "{% $PreDMSObjectKey %}"
+                },
+                {
+                  "Name": "TASK_TOKEN",
+                  "Value": "{% $states.context.Task.Token %}"
+                }
+              ]
+            }
+          ]
+        },
+        "Tags": "{% $Tags %}"
+      },
+      "Next": "Describe Replication Instance",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          }
+        }
+      ]
+    },
+    "Wait for instance to be available": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "Check status of Instance"
+    },
+    "is it cluster PITR ?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "Restore cluster to PIT",
+          "Condition": "{% $RestoreTime != '' %}",
+          "Comment": "Restore time is provided"
+        },
+        {
+          "Next": "Restore cluster from snapshot",
+          "Condition": "{% $SnapshotId!= '' %}"
+        }
+      ],
+      "Default": "missing snapshot ID or Restore time"
+    },
+    "missing snapshot ID or Restore time": {
+      "Type": "Fail"
+    },
+    "Restore cluster to PIT": {
+      "Type": "Task",
+      "Arguments": {
+        "DbClusterIdentifier": "{% $ResourceIdentifier %}",
+        "SourceDBClusterIdentifier": "{% $OriginDBIdentifier %}",
+        "RestoreToTime": "{% $RestoreTime %}",
+        "DbSubnetGroupName": "{% $DbSubnetGroupName %}",
+        "VpcSecurityGroupIds": [
+          "{% $DbSecurityGroupId  %}"
+        ],
+        "DeletionProtection": false,
+        "ServerlessV2ScalingConfiguration": {
+          "MinCapacity": 0.5,
+          "MaxCapacity": 1
+        },
+        "Tags": "{% $Tags %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:rds:restoreDBClusterToPointInTime",
+      "Next": "Create Instance for Cluster",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          }
+        }
+      ]
+    },
+    "Create Instance for Cluster": {
+      "Type": "Task",
+      "Arguments": {
+        "DbInstanceClass": "db.serverless",
+        "DbClusterIdentifier": "{% $ResourceIdentifier %}",
+        "DbInstanceIdentifier": "{% $ResourceIdentifier %}",
+        "Engine": "{% $DbEngine  %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:rds:createDBInstance",
+      "Next": "Check status of Instance",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          }
+        }
+      ]
+    },
+    "Restore cluster from snapshot": {
+      "Type": "Task",
+      "Arguments": {
+        "DbClusterIdentifier": "{% $ResourceIdentifier %}",
+        "Engine": "{% $DbEngine %}",
+        "SnapshotIdentifier": "{% $SnapshotId %}",
+        "DbSubnetGroupName": "{% $DbSubnetGroupName %}",
+        "VpcSecurityGroupIds": [
+          "{% $DbSecurityGroupId  %}"
+        ],
+        "ServerlessV2ScalingConfiguration": {
+          "MinCapacity": 0.5,
+          "MaxCapacity": 1
+        },
+        "DeletionProtection": false,
+        "CopyTagsToSnapshot": true,
+        "Tags": "{% $Tags %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:rds:restoreDBClusterFromSnapshot",
+      "Next": "Create Instance for Cluster",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          }
+        }
+      ]
+    },
+    "Describe Replication Instance": {
+      "Type": "Task",
+      "Arguments": {
+        "Filters": [
+          {
+            "Name": "rep-instance-id",
+            "Values": [
+              "{% $ResourceIdentifier %}"
+            ]
+          }
+        ]
+      },
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationInstances",
+      "Next": "Is the Replication Instance Ready ?"
+    },
+    "Is the Replication Instance Ready ?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "Wait for DMS replication instance to be available",
+          "Condition": "{% $states.input.ReplicationInstances[0].ReplicationInstanceStatus != 'available' %}",
+          "Comment": "DMS instance is not yet Available"
+        }
+      ],
+      "Default": "Create Postgres Endpoints"
+    },
+    "Wait for DMS replication instance to be available": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "Describe Replication Instance"
+    },
+    "Test endpoints": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "Test source Endpoint",
+          "States": {
+            "Test source Endpoint": {
+              "Type": "Task",
+              "Arguments": {
+                "EndpointArn": "{% $SourceEndpointArn %}",
+                "ReplicationInstanceArn": "{% $ReplicationInstanceArn %}"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:databasemigration:testConnection",
+              "Output": "{% $states.input %}",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Test target Endpoint",
+          "States": {
+            "Test target Endpoint": {
+              "Type": "Task",
+              "Arguments": {
+                "EndpointArn": "{% $TargetEndpointArn %}",
+                "ReplicationInstanceArn": "{% $ReplicationInstanceArn %}"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:databasemigration:testConnection",
+              "End": true
+            }
+          }
+        }
+      ],
+      "Output": "{% $states.input %}",
+      "Next": "For each Schema",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          },
+          "Comment": "Test endpoints failed"
+        }
+      ]
+    },
+    "For each Schema": {
+      "Type": "Map",
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "Create Replication Task",
+        "States": {
+          "Create Replication Task": {
+            "Type": "Task",
+            "Arguments": {
+              "MigrationType": "full-load",
+              "ReplicationInstanceArn": "{% $ReplicationInstanceArn %}",
+              "ReplicationTaskIdentifier": "{% $ResourceIdentifier & '-' & $states.input.index %}",
+              "SourceEndpointArn": "{% $SourceEndpointArn %}",
+              "TableMappings": "{% '{\"rules\":[{\"rule-type\":\"selection\",\"rule-id\":\"1\",\"rule-name\":\"select-source-schema\",\"object-locator\":{\"schema-name\":\"' & $states.input.value & '\",\"table-name\":\"%\"},\"rule-action\":\"include\"},{\"rule-type\":\"transformation\",\"rule-id\":\"2\",\"rule-name\":\"map-to-recovery-schema\",\"rule-target\":\"schema\",\"object-locator\":{\"schema-name\":\"' & $states.input.value & '\"},\"rule-action\":\"rename\",\"value\":\"' & $states.input.value & $RecoveredSchemasSuffix & '\"}]}' %}",
+              "TargetEndpointArn": "{% $TargetEndpointArn %}",
+              "ReplicationTaskSettings": "{\"TargetMetadata\":{\"TargetSchema\":\"\",\"SupportLobs\":true,\"FullLobMode\":false,\"LobChunkSize\":64,\"LimitedSizeLobMode\":true,\"LobMaxSize\":32,\"InlineLobMaxSize\":0,\"LoadMaxFileSize\":0,\"ParallelLoadThreads\":0,\"ParallelLoadBufferSize\":0,\"BatchApplyEnabled\":false,\"TaskRecoveryTableEnabled\":false,\"ParallelApplyThreads\":0,\"ParallelApplyBufferSize\":0},\"FullLoadSettings\":{\"TargetTablePrepMode\":\"DO_NOTHING\",\"CreatePkAfterFullLoad\":false,\"StopTaskCachedChangesApplied\":false,\"StopTaskCachedChangesNotApplied\":false,\"MaxFullLoadSubTasks\":10,\"TransactionConsistencyTimeout\":600,\"CommitRate\":10000},\"ValidationSettings\":{\"EnableValidation\":false,\"ValidationMode\":\"ROW_LEVEL\",\"ThreadCount\":5,\"PartitionSize\":10000,\"FailureMaxCount\":1000,\"RecordFailureDelayInMinutes\":5,\"RecordSuspendDelayInMinutes\":30,\"MaxKeyColumnSize\":8096,\"TableFailureMaxCount\":10000,\"ValidationOnly\":false,\"HandleCollationDiff\":false,\"RecordFailureDelayLimitInMinutes\":1,\"SkipLobColumns\":false,\"ValidationPartialLobSize\":0,\"ValidationQueryCdcDelaySeconds\":0},\"ErrorBehavior\":{\"DataErrorPolicy\":\"LOG_ERROR\",\"DataTruncationErrorPolicy\":\"LOG_ERROR\",\"DataMaskingErrorPolicy\":\"STOP_TASK\",\"DataErrorEscalationPolicy\":\"SUSPEND_TABLE\",\"DataErrorEscalationCount\":50,\"TableErrorPolicy\":\"SUSPEND_TABLE\",\"TableErrorEscalationPolicy\":\"STOP_TASK\",\"TableErrorEscalationCount\":50,\"RecoverableErrorCount\":-1,\"RecoverableErrorInterval\":5,\"RecoverableErrorThrottling\":true,\"RecoverableErrorThrottlingMax\":1800,\"ApplyErrorDeletePolicy\":\"LOG_ERROR\",\"ApplyErrorInsertPolicy\":\"LOG_ERROR\",\"ApplyErrorUpdatePolicy\":\"LOG_ERROR\",\"ApplyErrorEscalationPolicy\":\"LOG_ERROR\",\"ApplyErrorEscalationCount\":50,\"FullLoadIgnoreConflicts\":true},\"Logging\":{\"EnableLogging\":true,\"LogComponents\":[{\"Id\":\"SOURCE_UNLOAD\",\"Severity\":\"LOGGER_SEVERITY_DEFAULT\"},{\"Id\":\"TARGET_LOAD\",\"Severity\":\"LOGGER_SEVERITY_DEFAULT\"},{\"Id\":\"SOURCE_CAPTURE\",\"Severity\":\"LOGGER_SEVERITY_DEFAULT\"},{\"Id\":\"TARGET_APPLY\",\"Severity\":\"LOGGER_SEVERITY_INFO\"},{\"Id\":\"TASK_MANAGER\",\"Severity\":\"LOGGER_SEVERITY_DEFAULT\"}]}}",
+              "Tags": "{% $Tags %}"
+            },
+            "Resource": "arn:aws:states:::aws-sdk:databasemigration:createReplicationTask",
+            "Assign": {
+              "ReplicationTaskArn": "{% $states.result.ReplicationTask.ReplicationTaskArn %}"
+            },
+            "Next": "Describe Created Replication Task"
+          },
+          "Describe Created Replication Task": {
+            "Type": "Task",
+            "Arguments": {
+              "Filters": [
+                {
+                  "Name": "replication-task-arn",
+                  "Values": [
+                    "{% $ReplicationTaskArn %}"
+                  ]
+                }
+              ]
+            },
+            "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
+            "Next": "Is the task ready ?"
+          },
+          "Is the task ready ?": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Next": "Wait for Replication task to be ready",
+                "Condition": "{% $states.input.ReplicationTasks[0].Status != 'ready' %}",
+                "Comment": "No"
+              }
+            ],
+            "Default": "Start Replication Task"
+          },
+          "Wait for Replication task to be ready": {
+            "Type": "Wait",
+            "Seconds": 10,
+            "Next": "Describe Created Replication Task"
+          },
+          "Start Replication Task": {
+            "Type": "Task",
+            "Arguments": {
+              "ReplicationTaskArn": "{% $ReplicationTaskArn %}",
+              "StartReplicationTaskType": "start-replication"
+            },
+            "Resource": "arn:aws:states:::aws-sdk:databasemigration:startReplicationTask",
+            "Next": "Describe started Replication Task"
+          },
+          "Describe started Replication Task": {
+            "Type": "Task",
+            "Arguments": {
+              "Filters": [
+                {
+                  "Name": "replication-task-arn",
+                  "Values": [
+                    "{% $ReplicationTaskArn %}"
+                  ]
+                }
+              ]
+            },
+            "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
+            "Next": "Is it done ?"
+          },
+          "Is it done ?": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Next": "Wait for task to finish",
+                "Condition": "{% $states.input.ReplicationTasks[0].Status != 'stopped' %}",
+                "Comment": "Task finished"
+              },
+              {
+                "Next": "Task has failed",
+                "Condition": "{% $states.input.ReplicationTasks[0].Status = 'failed' %}",
+                "Comment": "Task has failed"
+              }
+            ],
+            "Default": "Done"
+          },
+          "Wait for task to finish": {
+            "Type": "Wait",
+            "Seconds": 5,
+            "Next": "Describe started Replication Task"
+          },
+          "Done": {
+            "Type": "Succeed"
+          },
+          "Task has failed": {
+            "Type": "Fail"
+          }
+        }
+      },
+      "Items": "{% $SchemasNames %}",
+      "Next": "Apply post DMS migration DDL",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          }
+        }
+      ],
+      "ItemSelector": {
+        "index": "{% $states.context.Map.Item.Index %}",
+        "value": "{% $states.context.Map.Item.Value %}"
+      }
+    },
+    "Apply post DMS migration DDL": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Arguments": {
+        "LaunchType": "FARGATE",
+        "Cluster": "{% $ECSClusterArn %}",
+        "TaskDefinition": "{% $DDLApplyTaskDefinitionArn %}",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "SecurityGroups": [
+              "{% $DDLApplyTaskSecurityGroupId %}"
+            ],
+            "Subnets": [
+              "{% $ECSTaskSubnet %}"
+            ],
+            "AssignPublicIp": "DISABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "{% $DDLApplyTaskContainerName %}",
+              "Environment": [
+                {
+                  "Name": "DB_SECRET_ARN",
+                  "Value": "{% $RDSSecretARN %}"
+                },
+                {
+                  "Name": "DB_NAME",
+                  "Value": "{% $DatabaseToRestore %}"
+                },
+                {
+                  "Name": "S3_BUCKET",
+                  "Value": "{% $DDLStorageBucket %}"
+                },
+                {
+                  "Name": "S3_OBJECT_KEY",
+                  "Value": "{% $PostDMSObjectKey %}"
+                },
+                {
+                  "Name": "TASK_TOKEN",
+                  "Value": "{% $states.context.Task.Token %}"
+                }
+              ]
+            }
+          ]
+        },
+        "Tags": "{% $Tags %}"
+      },
+      "Next": "Cleanup process",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          }
+        }
+      ]
+    },
+    "Cleanup process": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "Delete temporary Instance",
+          "States": {
+            "Delete temporary Instance": {
+              "Type": "Task",
+              "Arguments": {
+                "DbInstanceIdentifier": "{% $ResourceIdentifier %}",
+                "SkipFinalSnapshot": true,
+                "DeleteAutomatedBackups": true
+              },
+              "Resource": "arn:aws:states:::aws-sdk:rds:deleteDBInstance",
+              "Next": "Get temporary instance status",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "Rds.DbInstanceNotFoundException"
+                  ],
+                  "Comment": "Instance not found",
+                  "Next": "Was it a cluster ?"
+                }
+              ]
+            },
+            "Get temporary instance status": {
+              "Type": "Task",
+              "Arguments": {
+                "DbInstanceIdentifier": "{% $ResourceIdentifier %}"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:rds:describeDBInstances",
+              "Next": "Wait for instance deletion",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "Rds.DbInstanceNotFoundException"
+                  ],
+                  "Next": "Was it a cluster ?"
+                }
+              ]
+            },
+            "Wait for instance deletion": {
+              "Type": "Wait",
+              "Seconds": 10,
+              "Next": "Get temporary instance status"
+            },
+            "Was it a cluster ?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Next": "Delete temporary Aurora cluster",
+                  "Condition": "{% $IsCluster %}",
+                  "Comment": "it's was a cluster"
+                }
+              ],
+              "Default": "Success"
+            },
+            "Delete temporary Aurora cluster": {
+              "Type": "Task",
+              "Arguments": {
+                "DbClusterIdentifier": "{% $ResourceIdentifier %}",
+                "SkipFinalSnapshot": true
+              },
+              "Resource": "arn:aws:states:::aws-sdk:rds:deleteDBCluster",
+              "Next": "Get temporary Aurora cluster status"
+            },
+            "Get temporary Aurora cluster status": {
+              "Type": "Task",
+              "Arguments": {
+                "DbClusterIdentifier": "{% $ResourceIdentifier %}"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:rds:describeDBClusters",
+              "Next": "Wait for cluster deletion",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "Rds.DbClusterNotFoundException"
+                  ],
+                  "Next": "Success"
+                }
+              ]
+            },
+            "Wait for cluster deletion": {
+              "Type": "Wait",
+              "Seconds": 5,
+              "Next": "Get temporary Aurora cluster status"
+            },
+            "Success": {
+              "Type": "Succeed"
+            }
+          }
+        },
+        {
+          "StartAt": "DeleteSecret",
+          "States": {
+            "DeleteSecret": {
+              "Type": "Task",
+              "Arguments": {
+                "SecretId": "{% $ResourceIdentifier %}",
+                "ForceDeleteWithoutRecovery": true
+              },
+              "Resource": "arn:aws:states:::aws-sdk:secretsmanager:deleteSecret",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Need to delete pre DMS DDL object ?",
+          "States": {
+            "Need to delete pre DMS DDL object ?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Next": "Delete All DDL files",
+                  "Condition": "{% $exists($PreDMSObjectKey) %}",
+                  "Comment": "Yes"
+                }
+              ],
+              "Default": "DDL was not created"
+            },
+            "Delete All DDL files": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "pre-apply",
+                  "States": {
+                    "pre-apply": {
+                      "Type": "Task",
+                      "Arguments": {
+                        "Bucket": "{% $DDLStorageBucket %}",
+                        "Key": "{% $PreDMSObjectKey %}"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "complete-ddl",
+                  "States": {
+                    "complete-ddl": {
+                      "Type": "Task",
+                      "Arguments": {
+                        "Bucket": "{% $DDLStorageBucket %}",
+                        "Key": "{% $CompleteSchemaKey %}"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "post-apply",
+                  "States": {
+                    "post-apply": {
+                      "Type": "Task",
+                      "Arguments": {
+                        "Bucket": "{% $DDLStorageBucket %}",
+                        "Key": "{% $PostDMSObjectKey %}"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "End": true
+            },
+            "DDL was not created": {
+              "Type": "Succeed"
+            }
+          }
+        },
+        {
+          "StartAt": "Was a replication instance created ?",
+          "States": {
+            "Was a replication instance created ?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Next": "DMS cleanup complete",
+                  "Condition": "{% $exists($ReplicationInstanceArn) = false %}",
+                  "Comment": "No replication instance"
+                }
+              ],
+              "Default": "Describe Replication Tasks"
+            },
+            "Describe Replication Tasks": {
+              "Type": "Task",
+              "Arguments": {
+                "Filters": [
+                  {
+                    "Name": "replication-instance-arn",
+                    "Values": [
+                      "{% $ReplicationInstanceArn %}"
+                    ]
+                  }
+                ]
+              },
+              "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
+              "Next": "Map",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "DatabaseMigration.ResourceNotFoundException"
+                  ],
+                  "Next": "DescribeEndpoints"
+                }
+              ]
+            },
+            "Map": {
+              "Type": "Map",
+              "ItemProcessor": {
+                "ProcessorConfig": {
+                  "Mode": "INLINE"
+                },
+                "StartAt": "Delete the replication stack",
+                "States": {
+                  "Delete the replication stack": {
+                    "Type": "Task",
+                    "Arguments": {
+                      "ReplicationTaskArn": "{% $states.input.ReplicationTaskArn  %}"
+                    },
+                    "Resource": "arn:aws:states:::aws-sdk:databasemigration:deleteReplicationTask",
+                    "Next": "DescribeReplicationTasks",
+                    "Assign": {
+                      "ReplicationTaskArn": "{% $states.input.ReplicationTaskArn %}"
+                    }
+                  },
+                  "DescribeReplicationTasks": {
+                    "Type": "Task",
+                    "Arguments": {
+                      "Filters": [
+                        {
+                          "Name": "replication-task-arn",
+                          "Values": [
+                            "{% $ReplicationTaskArn %}"
+                          ]
+                        }
+                      ]
+                    },
+                    "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
+                    "Next": "Cleanup - Wait for task deletion",
+                    "Catch": [
+                      {
+                        "ErrorEquals": [
+                          "DatabaseMigration.ResourceNotFoundException"
+                        ],
+                        "Next": "Task deleted"
+                      }
+                    ]
+                  },
+                  "Cleanup - Wait for task deletion": {
+                    "Type": "Wait",
+                    "Seconds": 5,
+                    "Next": "DescribeReplicationTasks"
+                  },
+                  "Task deleted": {
+                    "Type": "Succeed"
+                  }
+                }
+              },
+              "Next": "DescribeEndpoints",
+              "Items": "{% $states.input.ReplicationTasks %}"
+            },
+            "DescribeEndpoints": {
+              "Type": "Task",
+              "Arguments": {
+                "Filters": [
+                  {
+                    "Name": "endpoint-id",
+                    "Values": [
+                      "{% 'source-' &  $ResourceIdentifier %}",
+                      "{% 'target-' &  $ResourceIdentifier %}"
+                    ]
+                  }
+                ]
+              },
+              "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeEndpoints",
+              "Next": "Parallel",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "DatabaseMigration.ResourceNotFoundException"
+                  ],
+                  "Next": "Check if a replication instance was created",
+                  "Comment": "No Endpoints found"
+                }
+              ]
+            },
+            "Parallel": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "Delete Source Endpoint",
+                  "States": {
+                    "Delete Source Endpoint": {
+                      "Type": "Task",
+                      "Arguments": {
+                        "EndpointArn": "{% $SourceEndpointArn %}"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:databasemigration:deleteEndpoint",
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "DeleteEndpoint",
+                  "States": {
+                    "DeleteEndpoint": {
+                      "Type": "Task",
+                      "Arguments": {
+                        "EndpointArn": "{% $TargetEndpointArn %}"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:databasemigration:deleteEndpoint",
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "Next": "Check if a replication instance was created"
+            },
+            "Check if a replication instance was created": {
+              "Type": "Task",
+              "Arguments": {
+                "Filters": [
+                  {
+                    "Name": "rep-instance-id",
+                    "Values": [
+                      "{% $ResourceIdentifier %}"
+                    ]
+                  }
+                ]
+              },
+              "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationInstances",
+              "Next": "DeleteReplicationInstance",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "DatabaseMigration.ResourceNotFoundException"
+                  ],
+                  "Next": "DMS cleanup complete",
+                  "Comment": "No instance was created"
+                }
+              ]
+            },
+            "DeleteReplicationInstance": {
+              "Type": "Task",
+              "Arguments": {
+                "ReplicationInstanceArn": "{% $ReplicationInstanceArn %}"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:databasemigration:deleteReplicationInstance",
+              "Next": "DescribeReplicationInstances"
+            },
+            "DescribeReplicationInstances": {
+              "Type": "Task",
+              "Arguments": {
+                "Filters": [
+                  {
+                    "Name": "rep-instance-arn",
+                    "Values": [
+                      "{% $ReplicationInstanceArn %}"
+                    ]
+                  }
+                ]
+              },
+              "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationInstances",
+              "Next": "Wait",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "DatabaseMigration.ResourceNotFoundException"
+                  ],
+                  "Comment": "ResourceNotFoundException",
+                  "Next": "DMS cleanup complete"
+                }
+              ]
+            },
+            "DMS cleanup complete": {
+              "Type": "Succeed"
+            },
+            "Wait": {
+              "Type": "Wait",
+              "Seconds": 10,
+              "Next": "DescribeReplicationInstances"
+            }
+          }
+        }
+      ],
+      "Next": "An error was raised ?",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "An error was raised ?",
+          "Output": {
+            "HasErrors": true
+          }
+        }
+      ]
+    },
+    "An error was raised ?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "Save failure",
+          "Condition": "{% $exists($HasErrors) %}"
+        }
+      ],
+      "Default": "Save completion"
+    },
+    "Save failure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Arguments": {
+        "TableName": "{% $DynamoDBTableName %}",
+        "Item": {
+          "restoreId": {
+            "S": "{% $states.context.Execution.Name %}"
+          },
+          "timestamp": {
+            "S": "{% $states.context.Execution.StartTime %}"
+          },
+          "status": "Failed"
+        }
+      },
+      "Next": "Restoration failed"
+    },
+    "Save completion": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Arguments": {
+        "TableName": "{% $DynamoDBTableName %}",
+        "Item": {
+          "restoreId": {
+            "S": "{% $states.context.Execution.Name %}"
+          },
+          "timestamp": {
+            "S": "{% $states.context.Execution.StartTime %}"
+          },
+          "status": "Done"
+        }
+      },
+      "Next": "Restoration successful"
+    },
+    "Restoration failed": {
+      "Type": "Fail"
+    },
+    "Restoration successful": {
+      "Type": "Succeed"
+    },
+    "Create Postgres Endpoints": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "Create Postgres Source Endpoint",
+          "States": {
+            "Create Postgres Source Endpoint": {
+              "Type": "Task",
+              "Arguments": {
+                "EndpointIdentifier": "{% 'source-' & $ResourceIdentifier %}",
+                "EndpointType": "source",
+                "EngineName": "{% $DbEngine %}",
+                "SslMode": "require",
+                "PostgreSQLSettings": {
+                  "SecretsManagerSecretId": "{% $RestoredDbSecretArn %}",
+                  "SecretsManagerAccessRoleArn": "{% $DMSRoleArn %}",
+                  "DatabaseName": "{% $DatabaseToRestore %}"
+                },
+                "Tags": "{% $Tags %}"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:databasemigration:createEndpoint",
+              "Output": {
+                "SourceEndpointArn": "{% $states.result.Endpoint.EndpointArn %}"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Create Postgres Target Endpoint",
+          "States": {
+            "Create Postgres Target Endpoint": {
+              "Type": "Task",
+              "Arguments": {
+                "EndpointIdentifier": "{% 'target-' & $ResourceIdentifier %}",
+                "EndpointType": "target",
+                "EngineName": "{% $DbEngine %}",
+                "SslMode": "require",
+                "ExtraConnectionAttributes": "loadUsingCSV=false;AfterConnectScript=SET session_replication_role = replica;ExecuteTimeout=300",
+                "PostgreSQLSettings": {
+                  "SecretsManagerSecretId": "{% $RDSSecretARN %}",
+                  "SecretsManagerAccessRoleArn": "{% $DMSRoleArn %}",
+                  "DatabaseName": "{% $DatabaseToRestore %}"
+                },
+                "Tags": "{% $Tags %}"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:databasemigration:createEndpoint",
+              "End": true,
+              "Output": {
+                "TargetEndpointArn": "{% $states.result.Endpoint.EndpointArn %}"
+              }
+            }
+          }
+        }
+      ],
+      "Next": "Test endpoints",
+      "Assign": {
+        "SourceEndpointArn": "{% $states.result[0].SourceEndpointArn %}",
+        "TargetEndpointArn": "{% $states.result[1].TargetEndpointArn %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Cleanup process",
+          "Assign": {
+            "HasErrors": true
+          }
+        }
+      ]
+    }
+  },
+  "QueryLanguage": "JSONata"
+} 
+        
+     
