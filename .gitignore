@@ -1,0 +1,22 @@
+.DS_Store
+!jest.config.js
+*.d.ts
+node_modules
+cdk.context.json
+.deployment-info
+.rds_instance_arn
+package-lock.json
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+deployment.json
+deployment.log
+dist
+deployment.log
+
+lib/containers/ddl-apply/global-bundle.pem
+lib/containers/ddl-extraction/global-bundle.pem
+
+checkov-results
+.checkov.yml
