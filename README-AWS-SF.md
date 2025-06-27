@@ -1,7 +1,7 @@
 # AWS Step Functions Workflow
 
 <picture>
-  <img alt="Step Functions Workflow" src="./architectures/stepfunctions.jpg" style="border: 1px solid #ddd; background-color: white; padding: 10px;" />
+  <img alt="AWS Step Functions Workflow" src="./architectures/stepfunctions.jpg" style="border: 1px solid #ddd; background-color: white; padding: 10px;" />
 </picture>
 
 The AWS Step Functions state machine orchestrates a workflow that coordinates Amazon RDS, AWS DMS, Amazon ECS, and Lambda functions to perform database and/or schema-level restoration operations.
